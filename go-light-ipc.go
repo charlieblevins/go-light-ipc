@@ -1,0 +1,248 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"io"
+	"net"
+	"strings"
+)
+
+type RpcStream struct {
+	Conn net.Conn
+
+	Registry RpcHandlerRegistry
+}
+
+// Start routing rpc requests to handlers, and sending back responses. This is the main
+// entry and exit point for the RPC socket system between electron main (nodejs)
+// and this golang process
+func (r RpcStream) Start() {
+
+	// Read bytes as they come in
+	for {
+
+		req := r.Read()
+
+		// Empty response happens when partial messages are received. Full message
+		// will be emitted after the final buffer is read
+		if req.Empty {
+			continue
+		}
+
+		LogInfo("Request > ", req.Method, req.ID)
+
+		// INVOKE requested method
+		invokeResult, err := r.Registry.Invoke(req, r)
+
+		// respond with error
+		if err != nil {
+			r.Respond(
+				RpcResponse{
+					"2.0",
+					nil,
+					&RpcError{
+						"32000",
+						err.Error(),
+						"",
+					},
+					req.ID,
+				},
+			)
+			continue
+		}
+
+		// respond with success
+		r.Respond(
+			RpcResponse{
+				"2.0",
+				invokeResult,
+				nil,
+				req.ID,
+			},
+		)
+	}
+
+}
+
+func (r *RpcStream) Read() RpcRequest {
+
+	reader := bufio.NewReader(r.Conn)
+
+	// Read next line
+	var b []byte
+	var err error
+	if b, err = reader.ReadBytes('\n'); err != nil {
+
+		if !r.isEOFErr(err) {
+			return r.EmptyReq()
+		}
+
+		LogErr("%s while reading", err)
+		return r.EmptyReq()
+	}
+	b = bytes.TrimSpace(b)
+
+	return r.MakeRequest(b)
+	/*
+	fullLength, err := r.Conn.Read(msgbuf)
+	if err != nil {
+		LogErr("Conn.Reaf failed.", err)
+		panic(err)
+	}
+
+	// Trim to exact size of message
+	fullMsg := msgbuf[0:fullLength]
+	var requests []RpcRequest
+
+	if len(fullMsg) < 4 {
+		fmt.Println("Received useless message of less than 4 bytes")
+		return append(requests, r.EmptyReq())
+	}
+
+	r.Message.AddChunk(fullMsg)
+
+
+	// If Partial is false, it means the stream is not awaiting any more pieces of a message, thus
+	// this incoming buffer must be the beginning of a new message
+	switch r.Message.State() {
+	case "COMPLETE":
+		req := r.MakeRequest(r.Message.AllBytes())
+		r.Message.Reset()
+		return req
+	case "PARTIAL":
+		return append(requests, r.EmptyReq())
+	case "MULTIPLE":
+
+		// TODO: split bytes into individual messages
+
+	case "BADFRAME":
+		r.Message.Reset()
+		LogErr("BADFRAME:: message was ignored")
+		return append(requests, r.EmptyReq())
+	default:
+		panic("Unexpected Message State")
+	}
+	*/
+}
+
+// isEOFErr checks whether the error is an EOF error
+// wsarecv is the error sent on Windows when the client closes its connection
+func (r RpcStream) isEOFErr(err error) bool {
+	return err == io.EOF || strings.Contains(strings.ToLower(err.Error()), "wsarecv:")
+}
+
+
+func (r RpcStream) EmptyReq() RpcRequest {
+	return RpcRequest{"", "", make(map[string]interface{}), "", true}
+}
+
+func (r RpcStream) MakeRequest(payload []byte) RpcRequest {
+
+	var req RpcRequest
+
+	err := json.Unmarshal(payload, &req)
+	if err != nil {
+		panic(err)
+	}
+
+	return req
+}
+
+// Convert an RpcResponse struct into write-able bytes with a frame
+// header, then write it to the socket
+func (r RpcStream) Respond(payload RpcResponse) {
+
+	if payload.Error != nil {
+		LogErr("Respond with !Error! > ", payload.Error.Message)
+	} else {
+		LogInfo("Respond >", payload.ID)
+	}
+
+	// stringify
+	payloadJson, err := json.Marshal(payload)
+	if err != nil {
+		panic(err)
+	}
+
+	// write to socket, appending a newline for delimiting at nodejs receiver
+	_, err = r.Conn.Write(append(payloadJson, []byte("\n")...))
+	if err != nil {
+		panic(err)
+	}
+}
+
+// Events are not really remote procedure calls, but are corraled into RpcResponse
+// for simpler data structure
+func (r RpcStream) SendEvent(name string, result interface{}) {
+	r.Respond(RpcResponse{
+		"2.0",
+		result,
+		nil,
+		"__EVENT__" + name,
+	})
+}
+
+type RpcRequest struct {
+	JsonRpc string                 `json:"jsonrpc"`
+	Method  string                 `json:"method"`
+	Params  map[string]interface{} `json:"params"`
+	ID      string                 `json:"id"`
+	Empty   bool
+}
+
+type RpcResponse struct {
+	JsonRpc string      `json:"jsonrpc"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   *RpcError   `json:"error,omitempty"`
+	ID      string      `json:"id"`
+}
+
+type RpcError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+	Data    string `json:"data,omitempty"`
+}
+
+type RpcHandlerRegistry struct {
+	Sync  map[string]RpcSyncHandler
+	Async map[string]RpcAsyncHandler
+}
+
+func (reg *RpcHandlerRegistry) AddSync(handler RpcSyncHandler) {
+	if reg.Sync == nil {
+		reg.Sync = make(map[string]RpcSyncHandler)
+	}
+	reg.Sync[handler.Name] = handler
+}
+func (reg *RpcHandlerRegistry) AddAsync(handler RpcAsyncHandler) {
+	if reg.Async == nil {
+		reg.Async = make(map[string]RpcAsyncHandler)
+	}
+	reg.Async[handler.Name] = handler
+}
+
+// Call the async or sync handler for this request, passingthe appropriate args,
+// and returning the interface or error generated by the handler
+func (reg RpcHandlerRegistry) Invoke(request RpcRequest, stream RpcStream) (interface{}, error) {
+
+	if sync, ok := reg.Sync[request.Method]; ok {
+		return sync.Fn(request.Params)
+	}
+
+	if async, ok := reg.Async[request.Method]; ok {
+		return async.Fn(request.Params, stream)
+	}
+
+	panic("Requested method is not registered.")
+}
+
+type RpcSyncHandler struct {
+	Name string
+	Fn   func(map[string]interface{}) (interface{}, error)
+}
+type RpcAsyncHandler struct {
+	Name string
+	Fn   func(map[string]interface{}, RpcStream) (interface{}, error)
+}
